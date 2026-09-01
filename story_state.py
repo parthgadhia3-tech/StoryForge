@@ -9,7 +9,11 @@ import re
 from datetime import datetime, timezone
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except FileExistsError:
+    pass
+
 
 
 def slugify(title: str) -> str:
