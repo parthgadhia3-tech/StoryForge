@@ -2,8 +2,8 @@
 StoryForge — a small platform for running a continuing AI story-video series.
 
 v1 scope (this build): series/character setup, story-state continuity, and
-LLM script generation per episode. Video generation is stubbed as the next
-module to wire in (Wan 2.1 on a Colab GPU worker).
+LLM script generation per episode. Video generation calls out to a Wan 2.2
+worker (running on a Kaggle GPU notebook, exposed via ngrok).
 """
 import streamlit as st
 import story_state as ss
@@ -18,6 +18,16 @@ st.caption("Your continuing AI story-video series — script + continuity engine
 # Sidebar: pick or create a series
 # ---------------------------------------------------------------------------
 st.sidebar.header("Series")
+
+st.sidebar.divider()
+st.sidebar.subheader("Video Worker")
+worker_url = st.sidebar.text_input(
+    "Video Worker URL (from Kaggle notebook)",
+    value=st.session_state.get("worker_url", ""),
+    placeholder="https://your-tunnel.ngrok-free.dev"
+)
+st.session_state.worker_url = worker_url
+st.sidebar.divider()
 
 existing = ss.list_series()
 options = ["+ Create new series"] + [s["title"] for s in existing]
@@ -136,8 +146,82 @@ if "pending_episode" in st.session_state:
 
     st.divider()
     st.subheader("🎥 Video generation")
-    st.info(
-        "Not wired up yet — this is the next module. Once saved, this episode's "
-        "scenes are ready to hand off to the Wan 2.1 video-generation worker "
-        "(run on a free Colab GPU) to produce the actual clips."
-    )
+
+    if not worker_url:
+        st.warning("Paste your Video Worker URL in the sidebar first.")
+    else:
+        import requests, base64, tempfile, os, subprocess
+
+        if "char_refs" not in st.session_state:
+            st.session_state.char_refs = {}
+
+        if st.button("🎬 Generate video for this episode"):
+            try:
+                # Step 1: get/reuse a reference image for the protagonist
+                protagonist = state["characters"][0]
+                if protagonist["name"] not in st.session_state.char_refs:
+                    with st.spinner(f"Creating reference image for {protagonist['name']}..."):
+                        resp = requests.post(
+                            f"{worker_url}/generate_reference",
+                            json={
+                                "character_name": protagonist["name"],
+                                "description": protagonist["description"],
+                                "art_style": state.get("art_style", ""),
+                            },
+                            timeout=300,
+                        )
+                        resp.raise_for_status()
+                        st.session_state.char_refs[protagonist["name"]] = resp.json()["image_b64"]
+
+                ref_b64 = st.session_state.char_refs[protagonist["name"]]
+
+                # Step 2: generate a clip per scene
+                clip_paths = []
+                tmp_dir = tempfile.mkdtemp()
+                progress = st.progress(0, text="Generating scenes...")
+
+                for i, sc in enumerate(ep["scenes"]):
+                    action_prompt = sc["action"]
+                    if sc.get("dialogue"):
+                        action_prompt += f" ({sc['dialogue']})"
+
+                    resp = requests.post(
+                        f"{worker_url}/generate_scene",
+                        json={
+                            "reference_image_b64": ref_b64,
+                            "action_prompt": action_prompt,
+                            "art_style": state.get("art_style", ""),
+                        },
+                        timeout=900,
+                    )
+                    resp.raise_for_status()
+                    video_b64 = resp.json()["video_b64"]
+
+                    clip_path = os.path.join(tmp_dir, f"scene_{i}.mp4")
+                    with open(clip_path, "wb") as f:
+                        f.write(base64.b64decode(video_b64))
+                    clip_paths.append(clip_path)
+
+                    progress.progress((i + 1) / len(ep["scenes"]), text=f"Scene {i+1}/{len(ep['scenes'])} done")
+
+                # Step 3: stitch clips together with ffmpeg
+                list_file = os.path.join(tmp_dir, "list.txt")
+                with open(list_file, "w") as f:
+                    for p in clip_paths:
+                        f.write(f"file '{p}'\n")
+
+                final_path = os.path.join(tmp_dir, "episode.mp4")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", final_path],
+                    check=True, capture_output=True,
+                )
+
+                st.success("Episode video ready!")
+                st.video(final_path)
+                with open(final_path, "rb") as f:
+                    st.download_button("⬇️ Download episode video", f, file_name="episode.mp4")
+
+            except requests.exceptions.RequestException as e:
+                st.error(f"Couldn't reach the video worker — is the Kaggle tab still open? ({e})")
+            except Exception as e:
+                st.error(f"Video generation failed: {e}")
